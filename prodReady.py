@@ -7,10 +7,13 @@ import statsmodels.api as sm
 import matplotlib.pyplot as plt
 import pandas as pd
 import ta
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.express as px
 
 DATA_DIR = "./data/minute/Weekly"
 
-st.title("Backtest Average Model with Smart Exit (Corrected)")
+st.title("Backtest Model")
 
 try:
     available_files = sorted([f for f in os.listdir(DATA_DIR) if f.endswith(".json")])
@@ -44,6 +47,57 @@ def compute_indicators(prices):
     signal = macd_indicator.macd_signal()
     return rsi.fillna(0).tolist(), macd.fillna(0).tolist(), signal.fillna(0).tolist()
 
+def calculate_sharpe_ratio(returns, risk_free_rate=0.02):
+    if len(returns) == 0 or returns.std() == 0:
+        return 0
+    excess_returns = returns.mean() - (risk_free_rate / 252)
+    return (excess_returns / returns.std()) * np.sqrt(252)
+
+def calculate_max_drawdown_detailed(equity_curve):
+    if len(equity_curve) == 0:
+        return 0, 0, 0, 0
+    
+    peak = equity_curve.cummax()
+    drawdown = equity_curve - peak
+    max_drawdown = drawdown.min()
+    
+    max_dd_idx = drawdown.idxmin()
+    peak_before_dd = peak.loc[:max_dd_idx].idxmax()
+    
+    dd_duration = max_dd_idx - peak_before_dd if max_dd_idx != peak_before_dd else 0
+    
+    peak_value = peak.loc[peak_before_dd] if peak_before_dd in peak.index else 0
+    max_dd_pct = (max_drawdown / peak_value * 100) if peak_value != 0 else 0
+    
+    return max_drawdown, max_dd_pct, dd_duration, peak_before_dd
+
+def close_position_eod(position, current_price, current_time, current_index, slippage_points, commission_per_trade):
+    """Close position at end of day"""
+    exit_price = current_price - slippage_points
+    exit_reason = "end_of_day"
+    
+    total_qty = position["lot_size"] * position["qty_per_lot"]
+    point_pnl = exit_price - position["entry_price"]
+    gross_pnl = point_pnl * total_qty
+    net_pnl = gross_pnl - (position["commission"] * 2)
+    
+    return {
+        "entry_index": position["entry_index"],
+        "exit_index": current_index,
+        "entry_time": position["entry_time"],
+        "exit_time": current_time,
+        "entry_price": position["entry_price"],
+        "exit_price": round(exit_price, 2),
+        "lot_size": position["lot_size"],
+        "qty_per_lot": position["qty_per_lot"],
+        "total_qty": total_qty,
+        "point_pnl": round(point_pnl, 2),
+        "gross_pnl": round(gross_pnl, 2),
+        "commission": round(position["commission"] * 2, 2),
+        "net_pnl": round(net_pnl, 2),
+        "exit_reason": exit_reason
+    }
+
 rsi_values, macd_values, signal_values = compute_indicators(prices)
 times = [datetime.fromisoformat(fix_timezone(ts)) for ts in timestamps]
 
@@ -66,17 +120,36 @@ commission_per_trade = st.sidebar.number_input("Commission per Trade", min_value
 
 st.sidebar.header("Advanced Settings")
 breakeven_percent = st.sidebar.slider("Move to breakeven at % of target", 0.0, 1.0, 0.7, 0.1)
+risk_free_rate = st.sidebar.number_input("Risk-free Rate (annual %)", min_value=0.0, max_value=10.0, value=2.0, step=0.1, help="Annual risk-free rate for Sharpe ratio calculation") / 100
+close_eod = st.sidebar.checkbox("Close positions at end of day", value=True, help="Automatically close any open position at the end of each trading day")
 
 if st.sidebar.button("Run Backtest"):
     np.random.seed(42)
     trades = []
     position = None
+    current_day = None
 
     for i in range(1, len(prices)):
         price = prices[i]
         low = lows[i]
         high = highs[i]
         open_price = opens[i]
+        current_time = times[i]
+        
+        # Check if we've moved to a new day
+        if current_day is None:
+            current_day = current_time.date()
+        
+        day_changed = current_time.date() != current_day
+        
+        # Close position at end of day if enabled and day has changed
+        if close_eod and day_changed and position is not None:
+            trade = close_position_eod(position, price, current_time, i, slippage_points, commission_per_trade)
+            trades.append(trade)
+            position = None
+        
+        # Update current day
+        current_day = current_time.date()
 
         if position is not None:
             if low <= position["trail_sl"]:
@@ -158,6 +231,7 @@ if st.sidebar.button("Run Backtest"):
             if should_enter:
                 entry_price_base = open_price
                 entry_price_final = entry_price_base + slippage_points
+
                 sl_level = entry_price_base - initial_sl
                 tp_level = entry_price_base + (initial_sl * target_rr)
 
@@ -175,6 +249,7 @@ if st.sidebar.button("Run Backtest"):
                     "commission": commission_per_trade
                 }
 
+    # Close any remaining position at the end of data
     if position is not None:
         exit_price = prices[-1] - slippage_points
         total_qty = position["lot_size"] * position["qty_per_lot"]
@@ -211,9 +286,17 @@ if st.sidebar.button("Run Backtest"):
         equity = trades_df["net_pnl"].cumsum()
         peak = equity.cummax()
         drawdown = equity - peak
-        max_drawdown = drawdown.min()
+        
+        max_drawdown, max_dd_pct, dd_duration, peak_before_dd = calculate_max_drawdown_detailed(equity)
+        
+        if len(trades_df) > 1:
+            daily_returns = trades_df.groupby(trades_df["entry_time"].dt.date)["net_pnl"].sum()
+            returns_series = pd.Series(daily_returns.values)
+            sharpe_ratio = calculate_sharpe_ratio(returns_series, risk_free_rate)
+        else:
+            sharpe_ratio = 0
 
-        col1, col2, col3 = st.columns(3)
+        col1, col2, col3, col4 = st.columns(4)
         with col1:
             st.metric("Total Trades", len(trades_df))
             st.metric("Win Rate", f"{(len(win_trades) / len(trades_df)):.1%}" if len(trades_df) > 0 else "N/A")
@@ -226,68 +309,137 @@ if st.sidebar.button("Run Backtest"):
             st.metric("Avg Net P&L / Trade", f"{trades_df['net_pnl'].mean():,.2f}")
         with col3:
             profit_factor = win_trades["net_pnl"].sum() / abs(loss_trades["net_pnl"].sum()) if not loss_trades.empty and loss_trades["net_pnl"].sum() != 0 else np.inf
-            st.metric("Max Drawdown", f"{max_drawdown:,.2f}")
             st.metric("Profit Factor", f"{profit_factor:.2f}")
             st.metric("Payoff Ratio", f"{(avg_win / abs(avg_loss)) if avg_loss != 0 else np.inf:.2f}")
+            st.metric("Sharpe Ratio", f"{sharpe_ratio:.2f}", help="Risk-adjusted return measure")
+        with col4:
+            st.metric("Max Drawdown ($)", f"{max_drawdown:,.2f}")
+            st.metric("Max Drawdown (%)", f"{max_dd_pct:.1f}%")
+            st.metric("DD Duration (trades)", f"{dd_duration:.0f}", help="Number of trades in max drawdown period")
 
-        st.subheader("Price Chart with Trade Entries and Exits")
-        fig, ax = plt.subplots(figsize=(15, 7))
-        ax.plot(times, prices, label="Price", color="black", linewidth=0.75, alpha=0.8)
-
-        ax.scatter(win_trades["entry_time"], win_trades["entry_price"], color="green", marker="^", s=80, label="Win Entry", alpha=0.9)
-        ax.scatter(loss_trades["entry_time"], loss_trades["entry_price"], color="red", marker="^", s=80, label="Loss Entry", alpha=0.9)
-        ax.scatter(win_trades["exit_time"], win_trades["exit_price"], color="blue", marker="v", s=80, label="Win Exit", alpha=0.9)
-        ax.scatter(loss_trades["exit_time"], loss_trades["exit_price"], color="purple", marker="v", s=80, label="Loss Exit", alpha=0.9)
+        st.subheader("Interactive Price Chart with Trade Entries and Exits")
         
-        ax.legend()
-        ax.set_title("Trade Entry & Exit Points")
-        ax.set_xlabel("Time")
-        ax.set_ylabel("Price")
-        ax.grid(True, linestyle='--', alpha=0.5)
-        plt.xticks(rotation=45)
-        plt.tight_layout()
-        st.pyplot(fig)
-
+        fig = go.Figure()
+        
+        fig.add_trace(go.Scatter(
+            x=times, 
+            y=prices,
+            mode='lines',
+            name='Price',
+            line=dict(color='white', width=1),
+            hovertemplate='<b>Price</b>: %{y:.2f}<br><b>Time</b>: %{x}<extra></extra>'
+        ))
+        
+        if not win_trades.empty:
+            fig.add_trace(go.Scatter(
+                x=win_trades["entry_time"], 
+                y=win_trades["entry_price"],
+                mode='markers',
+                name='Win Entry',
+                marker=dict(color='green', symbol='triangle-up', size=10),
+                hovertemplate='<b>Win Entry</b><br>Price: %{y:.2f}<br>Time: %{x}<extra></extra>'
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=win_trades["exit_time"], 
+                y=win_trades["exit_price"],
+                mode='markers',
+                name='Win Exit',
+                marker=dict(color='blue', symbol='triangle-down', size=10),
+                hovertemplate='<b>Win Exit</b><br>Price: %{y:.2f}<br>Time: %{x}<extra></extra>'
+            ))
+        
+        if not loss_trades.empty:
+            fig.add_trace(go.Scatter(
+                x=loss_trades["entry_time"], 
+                y=loss_trades["entry_price"],
+                mode='markers',
+                name='Loss Entry',
+                marker=dict(color='red', symbol='triangle-up', size=10),
+                hovertemplate='<b>Loss Entry</b><br>Price: %{y:.2f}<br>Time: %{x}<extra></extra>'
+            ))
+            
+            fig.add_trace(go.Scatter(
+                x=loss_trades["exit_time"], 
+                y=loss_trades["exit_price"],
+                mode='markers',
+                name='Loss Exit',
+                marker=dict(color='purple', symbol='triangle-down', size=10),
+                hovertemplate='<b>Loss Exit</b><br>Price: %{y:.2f}<br>Time: %{x}<extra></extra>'
+            ))
+        
+        fig.update_layout(
+            title="Trade Entry & Exit Points",
+            xaxis_title="Time",
+            yaxis_title="Price",
+            hovermode='closest',
+            showlegend=True,
+            height=600,
+            xaxis=dict(rangeslider=dict(visible=True)),
+        )
+        
+        st.plotly_chart(fig, use_container_width=True)
+        
         st.subheader("PnL Distribution")
-        fig2, ax2 = plt.subplots(figsize=(10, 5))
-        ax2.hist(trades_df["net_pnl"], bins=25, color="skyblue", edgecolor="black")
-        ax2.axvline(x=0, color='red', linestyle='--', linewidth=1)
-        ax2.set_title("Net PnL Distribution")
-        ax2.set_xlabel("Net PnL")
-        ax2.set_ylabel("Number of Trades")
-        st.pyplot(fig2)
+        fig_hist = px.histogram(
+            trades_df, 
+            x="net_pnl", 
+            nbins=25, 
+            title="Net PnL Distribution",
+            labels={'net_pnl': 'Net PnL', 'count': 'Number of Trades'}
+        )
+        fig_hist.add_vline(x=0, line_dash="dash", line_color="red", annotation_text="Break-even")
+        fig_hist.update_layout(height=400)
+        st.plotly_chart(fig_hist, use_container_width=True)
 
-        st.subheader("Equity Curve")
-        fig3, ax3 = plt.subplots(figsize=(10, 5))
-        ax3.plot(equity.index, equity, label="Cumulative P&L", color="blue")
-        ax3.fill_between(equity.index, equity, peak, color="red", alpha=0.3, label="Drawdown")
-        ax3.set_title("Equity Curve and Drawdown")
-        ax3.set_xlabel("Trade #")
-        ax3.set_ylabel("Cumulative P&L")
-        ax3.legend()
-        ax3.grid(True)
-        st.pyplot(fig3)
+        st.subheader("Equity Curve and Drawdown")
+        fig_equity = make_subplots(rows=2, cols=1, 
+                                   shared_xaxes=True,
+                                   subplot_titles=('Cumulative P&L', 'Drawdown'),
+                                   vertical_spacing=0.1)
+        
+        fig_equity.add_trace(
+            go.Scatter(x=equity.index, y=equity, name="Cumulative P&L", line=dict(color='blue')),
+            row=1, col=1
+        )
+        
+        fig_equity.add_trace(
+            go.Scatter(x=drawdown.index, y=drawdown, name="Drawdown", 
+                      fill='tonexty', fillcolor='rgba(255,0,0,0.3)', line=dict(color='red')),
+            row=2, col=1
+        )
+        
+        fig_equity.update_layout(height=600, title_text="Equity Curve and Drawdown Analysis")
+        fig_equity.update_xaxes(title_text="Trade Number", row=2, col=1)
+        fig_equity.update_yaxes(title_text="Cumulative P&L", row=1, col=1)
+        fig_equity.update_yaxes(title_text="Drawdown", row=2, col=1)
+        
+        st.plotly_chart(fig_equity, use_container_width=True)
         
         col_a, col_b = st.columns(2)
         with col_a:
             st.subheader("Win/Loss Breakdown")
-            fig4, ax4 = plt.subplots()
             if len(win_trades) > 0 or len(loss_trades) > 0:
-                ax4.pie([len(win_trades), len(loss_trades)], labels=["Wins", "Losses"], autopct="%1.1f%%", colors=["#2ca02c", "#d62728"], explode=(0.1, 0), shadow=True, startangle=90)
-                ax4.axis('equal')
-            st.pyplot(fig4)
+                fig_pie = px.pie(
+                    values=[len(win_trades), len(loss_trades)], 
+                    names=["Wins", "Losses"],
+                    color_discrete_sequence=['#2ca02c', '#d62728']
+                )
+                fig_pie.update_traces(textposition='inside', textinfo='percent+label')
+                fig_pie.update_layout(height=400)
+                st.plotly_chart(fig_pie, use_container_width=True)
         
         with col_b:
             st.subheader("Exit Reason Breakdown")
             exit_counts = trades_df["exit_reason"].value_counts()
-            fig5, ax5 = plt.subplots()
-            exit_counts.plot(kind="bar", color="teal", ax=ax5)
-            ax5.set_title("Count of Exit Reasons")
-            ax5.set_xlabel("Exit Reason")
-            ax5.set_ylabel("Count")
-            plt.xticks(rotation=45, ha='right')
-            plt.tight_layout()
-            st.pyplot(fig5)
+            fig_bar = px.bar(
+                x=exit_counts.index, 
+                y=exit_counts.values,
+                labels={'x': 'Exit Reason', 'y': 'Count'},
+                title="Count of Exit Reasons"
+            )
+            fig_bar.update_layout(height=400)
+            st.plotly_chart(fig_bar, use_container_width=True)
         
         st.subheader("Daily Trade Statistics")
         trades_df["trade_date"] = trades_df["entry_time"].dt.date
@@ -306,8 +458,8 @@ if st.sidebar.button("Run Backtest"):
         commission_impact = (total_commission / total_gross_pnl) * 100 if total_gross_pnl > 0 else 0
         
         comm_col1, comm_col2, comm_col3 = st.columns(3)
-        comm_col1.metric("Total Commission Paid", f"${total_commission:,.2f}")
-        comm_col2.metric("Gross P&L (pre-commission)", f"${total_gross_pnl:,.2f}")
+        comm_col1.metric("Total Commission Paid", f"{total_commission:,.2f}")
+        comm_col2.metric("Gross P&L (pre-commission)", f"{total_gross_pnl:,.2f}")
         comm_col3.metric("Commission Impact", f"{commission_impact:.2f}%", help="Percentage of gross profit consumed by commissions.")
 
     else:
